@@ -15,7 +15,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 from mlx_lm import load
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
 
@@ -32,17 +32,76 @@ class WeightBlock:
     y: int = 0
 
 
-# Wong colorblind-friendly palette (RGB)
-# From Bang Wong, Nature Methods 8, 441 (2011)
-WONG_PALETTE = [
-    (230, 159, 0),    # Orange
-    (86, 180, 233),   # Sky blue
-    (0, 158, 115),    # Bluish green
-    (240, 228, 66),   # Yellow
-    (0, 114, 178),    # Blue
-    (213, 94, 0),     # Vermillion
-    (204, 121, 167),  # Reddish purple
-]
+# Palette definitions (RGB), sourced from Matplotlib's categorical palettes.
+PALETTES = {
+    "tab20": [
+        (31, 119, 180),
+        (255, 127, 14),
+        (44, 160, 44),
+        (214, 39, 40),
+        (148, 103, 189),
+        (140, 86, 75),
+        (227, 119, 194),
+        (127, 127, 127),
+        (188, 189, 34),
+        (23, 190, 207),
+        (174, 199, 232),
+        (255, 187, 120),
+        (152, 223, 138),
+        (255, 152, 150),
+        (197, 176, 213),
+        (196, 156, 148),
+        (247, 182, 210),
+        (199, 199, 199),
+        (219, 219, 141),
+        (158, 218, 229),
+    ],
+    "tab20b": [
+        (57, 59, 121),
+        (82, 84, 163),
+        (107, 110, 207),
+        (156, 158, 222),
+        (99, 121, 57),
+        (140, 162, 82),
+        (181, 207, 107),
+        (206, 219, 156),
+        (140, 109, 49),
+        (189, 158, 57),
+        (231, 186, 82),
+        (231, 203, 148),
+        (132, 60, 57),
+        (189, 72, 65),
+        (231, 97, 97),
+        (231, 150, 156),
+        (109, 68, 121),
+        (150, 98, 165),
+        (189, 143, 198),
+        (210, 185, 208),
+    ],
+    "tab20c": [
+        (49, 130, 189),
+        (107, 174, 214),
+        (158, 202, 225),
+        (198, 219, 239),
+        (230, 85, 13),
+        (253, 141, 60),
+        (253, 174, 107),
+        (253, 208, 162),
+        (49, 163, 84),
+        (116, 196, 118),
+        (161, 217, 155),
+        (199, 233, 192),
+        (132, 60, 57),
+        (173, 73, 74),
+        (214, 97, 107),
+        (231, 150, 156),
+        (123, 65, 115),
+        (165, 81, 148),
+        (206, 109, 189),
+        (222, 158, 214),
+    ],
+}
+DEFAULT_PALETTE_NAME = "tab20"
 
 
 def normalize_weight_name(name: str) -> str:
@@ -61,23 +120,29 @@ def normalize_weight_name(name: str) -> str:
 
 
 class ColorAssigner:
-    """Assigns colors to weight categories dynamically using the Wong palette."""
+    """Assigns colors to weight categories dynamically using the selected palette."""
 
-    def __init__(self):
+    def __init__(self, palette: list[tuple[int, int, int]]):
         self.category_to_color: dict[str, tuple[int, int, int]] = {}
+        self.next_color_idx = 0
+        self.palette = palette
+
+    def set_palette(self, palette: list[tuple[int, int, int]]) -> None:
+        self.palette = palette
+        self.category_to_color.clear()
         self.next_color_idx = 0
 
     def get_color(self, category: str) -> tuple[int, int, int]:
         """Get a color for a category, assigning a new one if needed."""
         if category not in self.category_to_color:
-            color = WONG_PALETTE[self.next_color_idx % len(WONG_PALETTE)]
+            color = self.palette[self.next_color_idx % len(self.palette)]
             self.category_to_color[category] = color
             self.next_color_idx += 1
         return self.category_to_color[category]
 
 
 # Global color assigner instance
-color_assigner = ColorAssigner()
+color_assigner = ColorAssigner(PALETTES[DEFAULT_PALETTE_NAME])
 
 
 def categorize_weight(name: str) -> str:
@@ -274,7 +339,37 @@ def reduce_weights(weights: np.ndarray, scale: int, method: str = "mean") -> np.
     return reduced.flatten()
 
 
-def create_weight_blocks(weights: list[tuple[str, mx.array]], scale: int = 1, scale_method: str = "mean", show_histogram: bool = False) -> list[WeightBlock]:
+def apply_intensity_curve(
+    values: np.ndarray,
+    method: str,
+    gamma: float,
+    sigmoid_k: float,
+) -> np.ndarray:
+    """Adjust normalized values to improve visual contrast."""
+    if method == "linear":
+        return values
+    if method == "gamma":
+        return np.power(values, gamma)
+    if method == "smoothstep":
+        return values * values * (3.0 - 2.0 * values)
+    if method == "sigmoid":
+        k = max(0.1, sigmoid_k)
+        y = 1.0 / (1.0 + np.exp(-k * (values - 0.5)))
+        y0 = 1.0 / (1.0 + np.exp(0.5 * k))
+        y1 = 1.0 / (1.0 + np.exp(-0.5 * k))
+        return (y - y0) / (y1 - y0)
+    raise ValueError(f"Unknown intensity method: {method}")
+
+
+def create_weight_blocks(
+    weights: list[tuple[str, mx.array]],
+    scale: int = 1,
+    scale_method: str = "mean",
+    intensity_method: str = "sigmoid",
+    intensity_gamma: float = 0.75,
+    intensity_sigmoid_k: float = 6.0,
+    show_histogram: bool = False,
+) -> list[WeightBlock]:
     """Create WeightBlock objects from weight tensors."""
     # First pass: reduce all weights
     reduced_weights = []
@@ -305,6 +400,12 @@ def create_weight_blocks(weights: list[tuple[str, mx.array]], scale: int = 1, sc
         # Normalize each block to its own range for maximum contrast
         block_min, block_max = float(reduced.min()), float(reduced.max())
         normalized = normalize_array(reduced, block_min, block_max)
+        normalized = apply_intensity_curve(
+            normalized,
+            method=intensity_method,
+            gamma=intensity_gamma,
+            sigmoid_k=intensity_sigmoid_k,
+        )
 
         category = categorize_weight(name)
         # Dimensions will be set during packing, so use placeholder values
@@ -754,7 +855,301 @@ def render_image(
     return Image.fromarray(canvas)
 
 
+def render_framed_image(
+    blocks: list[WeightBlock],
+    width: int,
+    height: int,
+    model_name: str,
+    total_params: int,
+    scale: int,
+    scale_method: str,
+    padding: int,
+    packing: str,
+    frame_padding: int = 40,
+    section_gap: int = 24,
+    bottom_padding: int = 40,
+    font_size: int = 20,
+    line_spacing: int | None = None,
+    inner_border_width: int = 0,
+    inner_border_color: tuple[int, int, int] = (120, 120, 120),
+    background: tuple[int, int, int] = (20, 20, 20),
+    frame_color: tuple[int, int, int] = (40, 40, 40),
+    text_color: tuple[int, int, int] = (200, 200, 200),
+) -> Image.Image:
+    """Render the weight visualization with a frame, info text, and legend."""
+
+    def font_for_size(size: int) -> ImageFont.ImageFont:
+        for path in (
+            # Prefer Fira Code (monospace) for all text.
+            "/Library/Fonts/FiraCode-Regular.ttf",
+            str(Path.home() / "Library/Fonts/FiraCode-Regular.ttf"),
+            "/usr/share/fonts/truetype/firacode/FiraCode-Regular.ttf",
+            "/usr/share/fonts/truetype/fira-code/FiraCode-Regular.ttf",
+            # Fall back to other common monospace fonts.
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        ):
+            try:
+                if Path(path).exists():
+                    return ImageFont.truetype(path, size)
+            except (OSError, IOError):
+                continue
+        return ImageFont.load_default()
+
+    def text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> int:
+        left, _, right, _ = draw.textbbox((0, 0), text, font=font)
+        return int(right - left)
+
+    def text_height(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> int:
+        _, top, _, bottom = draw.textbbox((0, 0), text, font=font)
+        return int(bottom - top)
+
+    def fit_font(
+        draw: ImageDraw.ImageDraw,
+        text: str,
+        max_width: int,
+        base_size: int,
+        min_size: int,
+    ) -> ImageFont.ImageFont:
+        for size in range(base_size, min_size - 1, -1):
+            font = font_for_size(size)
+            if text_width(draw, text, font) <= max_width:
+                return font
+        return font_for_size(min_size)
+
+    def ellipsize(
+        draw: ImageDraw.ImageDraw,
+        text: str,
+        font: ImageFont.ImageFont,
+        max_width: int,
+    ) -> str:
+        if text_width(draw, text, font) <= max_width:
+            return text
+        suffix = "…"
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            candidate = text[:mid].rstrip() + suffix
+            if text_width(draw, candidate, font) <= max_width:
+                lo = mid + 1
+            else:
+                hi = mid
+        return (text[: max(0, lo - 1)].rstrip() + suffix) if lo > 0 else suffix
+
+    def draw_centered_text(
+        draw: ImageDraw.ImageDraw,
+        y: int,
+        text: str,
+        font: ImageFont.ImageFont,
+    ) -> None:
+        w = text_width(draw, text, font)
+        x = frame_padding + max(0, (content_width - w) // 2)
+        draw.text((x, y), text, fill=text_color, font=font)
+
+    def layout_legend_lines(
+        draw: ImageDraw.ImageDraw,
+        items: list[tuple[str, tuple[int, int, int]]],
+        font: ImageFont.ImageFont,
+        max_width: int,
+        swatch: int,
+        swatch_text_gap: int,
+        gap: int,
+    ) -> tuple[list[list[tuple[str, tuple[int, int, int], int]]], list[int], int]:
+        if not items:
+            return [], [], 0
+
+        def entry_width(label: str) -> int:
+            return swatch + swatch_text_gap + text_width(draw, label, font)
+
+        n = len(items)
+
+        def try_columns(cols: int) -> tuple[list[list[tuple[str, tuple[int, int, int], int]]], list[int], int] | None:
+            cols = max(1, cols)
+            rows = (n + cols - 1) // cols
+
+            prepared: list[tuple[str, tuple[int, int, int], int]] = [(label, color, entry_width(label)) for label, color in items]
+
+            col_widths = [0] * cols
+            grid: list[list[tuple[str, tuple[int, int, int], int]]] = [[] for _ in range(rows)]
+            for idx, entry in enumerate(prepared):
+                r = idx // cols
+                c = idx % cols
+                grid[r].append(entry)
+                col_widths[c] = max(col_widths[c], entry[2])
+
+            total_w = sum(col_widths) + gap * (cols - 1)
+            if total_w <= max_width:
+                return grid, col_widths, total_w
+            return None
+
+        for cols in range(n, 0, -1):
+            candidate = try_columns(cols)
+            if candidate is not None:
+                return candidate
+
+        # Should be unreachable because cols=1 must fit after ellipsizing, but keep a safe fallback.
+        prepared = [(label, color, entry_width(label)) for label, color in items]
+        col_w = max((p[2] for p in prepared), default=0)
+        return [[p] for p in prepared], [col_w], col_w
+
+    # Render the main visualization
+    main_image = render_image(blocks, width, height, background)
+
+    # Calculate dimensions for frame, text, and legend
+    frame_padding = max(0, int(frame_padding))
+    section_gap = max(0, int(section_gap))
+    bottom_padding = max(0, int(bottom_padding))
+    font_size = max(6, int(font_size))
+    if line_spacing is None:
+        line_spacing = max(4, int(round(font_size * 0.35)))
+    else:
+        line_spacing = max(0, int(line_spacing))
+    inner_border_width = max(0, int(inner_border_width))
+
+    total_width = width + (frame_padding * 2)
+
+    # Measure text and compute dynamic section heights before allocating final canvas
+    measure_img = Image.new("RGB", (total_width, 10), frame_color)
+    measure_draw = ImageDraw.Draw(measure_img)
+    content_width = total_width - (frame_padding * 2)
+
+    title_base_size = max(font_size + 2, int(round(font_size * 1.6)))
+    title_min_size = max(10, int(round(font_size * 0.9)))
+    legend_size = max(6, int(round(font_size * 0.8)))
+
+    title_font = fit_font(measure_draw, model_name, content_width, base_size=title_base_size, min_size=title_min_size)
+    info_font = font_for_size(font_size)
+    legend_font = font_for_size(legend_size)
+
+    title_h = text_height(measure_draw, "Ag", title_font)
+    info_h = text_height(measure_draw, "Ag", info_font)
+
+    params_str = f"{total_params:,} parameters"
+    params_str = ellipsize(measure_draw, params_str, info_font, content_width)
+
+    info_height = title_h + line_spacing + info_h
+
+    # Get unique categories and their colors (for legend sizing)
+    categories: dict[str, tuple[int, int, int]] = {}
+    for block in blocks:
+        if block.category not in categories:
+            categories[block.category] = color_assigner.get_color(block.category)
+
+    legend_items = []
+    for category, color in sorted(categories.items()):
+        display_name = category.replace("model.layers.N.", "").replace("model.", "")
+        legend_items.append((display_name, color))
+
+    legend_line_h = text_height(measure_draw, "Ag", legend_font)
+    swatch_size = max(12, int(round(legend_line_h * 0.95)))
+    swatch_text_gap = 12
+
+    # Never truncate legend entries: if a single label doesn't fit even alone, shrink legend font.
+    if legend_items:
+        longest_label = max((label for label, _c in legend_items), key=len)
+        legend_font = fit_font(
+            measure_draw,
+            longest_label,
+            max(10, content_width - (swatch_size + swatch_text_gap)),
+            base_size=legend_size,
+            min_size=6,
+        )
+        legend_line_h = text_height(measure_draw, "Ag", legend_font)
+        swatch_size = max(12, int(round(legend_line_h * 0.95)))
+
+    legend_row_h = max(swatch_size, legend_line_h) + 8
+    legend_gap = max(16, int(round(font_size * 1.2)))
+    legend_bottom_padding = 6
+
+    legend_lines, legend_col_widths, legend_total_w = layout_legend_lines(
+        measure_draw,
+        legend_items,
+        legend_font,
+        content_width,
+        swatch=swatch_size,
+        swatch_text_gap=swatch_text_gap,
+        gap=legend_gap,
+    )
+    legend_rows = len(legend_lines)
+    legend_height = (legend_rows * legend_row_h) + legend_bottom_padding
+
+    total_height = (
+        frame_padding
+        + height
+        + section_gap
+        + info_height
+        + section_gap
+        + legend_height
+        + bottom_padding
+    )
+
+    # Create the framed image
+    framed = Image.new("RGB", (total_width, total_height), frame_color)
+
+    # Paste the main visualization
+    framed.paste(main_image, (frame_padding, frame_padding))
+
+    # Draw text and legend
+    draw = ImageDraw.Draw(framed)
+
+    # Optional border around the main visualization
+    if inner_border_width > 0:
+        x1 = frame_padding
+        y1 = frame_padding
+        x2 = frame_padding + width - 1
+        y2 = frame_padding + height - 1
+        for i in range(inner_border_width):
+            draw.rectangle([x1 + i, y1 + i, x2 - i, y2 - i], outline=inner_border_color, width=1)
+
+    # Model info section (below the visualization)
+    info_y = frame_padding + height + section_gap
+
+    # Model name
+    draw_centered_text(draw, info_y, ellipsize(draw, model_name, title_font, content_width), title_font)
+
+    # Parameters and generation info
+    info_line_y = info_y + title_h + line_spacing
+    draw_centered_text(draw, info_line_y, params_str, info_font)
+
+    # Legend section
+    legend_y = info_y + info_height + section_gap
+
+    def draw_legend_entry(x: int, y: int, label: str, color: tuple[int, int, int]) -> None:
+        draw.rectangle([x, y, x + swatch_size, y + swatch_size], fill=color)
+        bbox = draw.textbbox((0, 0), label, font=legend_font)
+        text_h = bbox[3] - bbox[1]
+        text_y = y + (swatch_size - text_h) // 2 - bbox[1]
+        draw.text((x + swatch_size + swatch_text_gap, text_y), label, fill=text_color, font=legend_font)
+
+    # Legend grid (centered as a block); columns align across rows and last row is not re-centered.
+    legend_start_x = frame_padding + max(0, (content_width - legend_total_w) // 2)
+    col_starts = []
+    x = legend_start_x
+    for i, w in enumerate(legend_col_widths):
+        col_starts.append(x)
+        x += w + (legend_gap if i < len(legend_col_widths) - 1 else 0)
+
+    for row, line in enumerate(legend_lines):
+        y = legend_y + (row * legend_row_h)
+        for col, (label, color, _w) in enumerate(line):
+            draw_legend_entry(col_starts[col], y, label, color)
+
+    return framed
+
+
 def main():
+    def parse_rgb(value: str) -> tuple[int, int, int]:
+        v = value.strip()
+        if v.startswith("#"):
+            v = v[1:]
+        if len(v) == 6 and all(c in "0123456789abcdefABCDEF" for c in v):
+            return (int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16))
+        parts = [p.strip() for p in value.split(",")]
+        if len(parts) == 3 and all(p.isdigit() for p in parts):
+            r, g, b = (int(p) for p in parts)
+            if all(0 <= x <= 255 for x in (r, g, b)):
+                return (r, g, b)
+        raise argparse.ArgumentTypeError("Expected '#RRGGBB' or 'R,G,B' with 0-255 components")
+
     parser = argparse.ArgumentParser(
         description="Generate artistic visualizations of neural network weights."
     )
@@ -779,8 +1174,8 @@ def main():
     parser.add_argument(
         "--scale",
         type=int,
-        default=1,
-        help="Reduce image size by averaging NxN weight blocks into single pixels (default: 1, no reduction)",
+        default=10,
+        help="Reduce image size by averaging NxN weight blocks into single pixels (default: 10)",
     )
     parser.add_argument(
         "--histogram",
@@ -791,11 +1186,102 @@ def main():
         "--scale-method",
         type=str,
         choices=["mean", "median", "max", "sample"],
-        default="mean",
+        default="sample",
         help="Method for reducing pixels: mean (average), median (balanced), max (extremes), sample (first value)",
+    )
+    parser.add_argument(
+        "--intensity-method",
+        type=str,
+        choices=["linear", "gamma", "smoothstep", "sigmoid"],
+        default="sigmoid",
+        help="Intensity curve to spread normalized values (default: sigmoid)",
+    )
+    parser.add_argument(
+        "--intensity-gamma",
+        type=float,
+        default=0.75,
+        help="Gamma value for intensity curve when using --intensity-method gamma (default: 0.75)",
+    )
+    parser.add_argument(
+        "--intensity-sigmoid-k",
+        type=float,
+        default=6.0,
+        help="Steepness for sigmoid intensity curve (default: 6.0)",
+    )
+    parser.add_argument(
+        "--palette",
+        type=str,
+        choices=sorted(PALETTES.keys()),
+        default=DEFAULT_PALETTE_NAME,
+        help=f"Color palette for layer categories (default: {DEFAULT_PALETTE_NAME})",
+    )
+    parser.add_argument(
+        "--packing",
+        type=str,
+        choices=["maxrects", "guillotine", "shelf"],
+        default="maxrects",
+        help="Block packing algorithm (default: maxrects)",
+    )
+    parser.add_argument(
+        "--no-frame",
+        action="store_true",
+        help="Output just the visualization without frame/info/legend",
+    )
+    parser.add_argument(
+        "--frame-padding",
+        type=int,
+        default=80,
+        help="Padding around visualization inside the frame (default: 80)",
+    )
+    parser.add_argument(
+        "--frame-section-gap",
+        type=int,
+        default=80,
+        help="Vertical gap between footer sections (default: 80)",
+    )
+    parser.add_argument(
+        "--frame-bottom-padding",
+        type=int,
+        default=40,
+        help="Bottom padding below the legend (default: 40)",
+    )
+    parser.add_argument(
+        "--frame-font-size",
+        type=int,
+        default=60,
+        help="Base font size for all frame text (default: 60)",
+    )
+    parser.add_argument(
+        "--frame-line-spacing",
+        type=int,
+        default=None,
+        help="Vertical spacing between footer text lines (default: 0.35 * font size)",
+    )
+    parser.add_argument(
+        "--frame-bg",
+        type=parse_rgb,
+        default=(0, 0, 0),
+        help="Frame background color, '#RRGGBB' or 'R,G,B' (default: 0,0,0)",
+    )
+    parser.add_argument(
+        "--inner-border-width",
+        type=int,
+        default=5,
+        help="Border width around the weights visualization in pixels (default: 5)",
+    )
+    parser.add_argument(
+        "--inner-border-color",
+        type=parse_rgb,
+        default=(255, 255, 255),
+        help="Border color around the weights visualization, '#RRGGBB' or 'R,G,B' (default: 255,255,255)",
     )
 
     args = parser.parse_args()
+
+    palette = PALETTES[args.palette]
+    if len(palette) < 16:
+        raise SystemExit("Selected palette must have at least 16 colors.")
+    color_assigner.set_palette(palette)
 
     print(f"Loading model: {args.model}")
     model, tokenizer = load(args.model)
@@ -807,12 +1293,46 @@ def main():
     total_params = sum(np.prod(w.shape) for _, w in weights)
     print(f"Total parameters: {total_params:,}")
 
-    blocks = create_weight_blocks(weights, scale=args.scale, scale_method=args.scale_method, show_histogram=args.histogram)
+    blocks = create_weight_blocks(
+        weights,
+        scale=args.scale,
+        scale_method=args.scale_method,
+        intensity_method=args.intensity_method,
+        intensity_gamma=args.intensity_gamma,
+        intensity_sigmoid_k=args.intensity_sigmoid_k,
+        show_histogram=args.histogram,
+    )
 
-    width, height, positioned_blocks = pack_blocks_maxrects(blocks, padding=args.padding)
+    packers = {
+        "maxrects": pack_blocks_maxrects,
+        "guillotine": pack_blocks_guillotine,
+        "shelf": pack_blocks_shelf,
+    }
+    width, height, positioned_blocks = packers[args.packing](blocks, padding=args.padding)
     print(f"Canvas size: {width} x {height} pixels")
 
-    img = render_image(positioned_blocks, width, height)
+    if args.no_frame:
+        img = render_image(positioned_blocks, width, height)
+    else:
+        img = render_framed_image(
+            positioned_blocks,
+            width,
+            height,
+            model_name=args.model,
+            total_params=total_params,
+            scale=args.scale,
+            scale_method=args.scale_method,
+            padding=args.padding,
+            packing=args.packing,
+            frame_padding=args.frame_padding,
+            section_gap=args.frame_section_gap,
+            bottom_padding=args.frame_bottom_padding,
+            font_size=args.frame_font_size,
+            line_spacing=args.frame_line_spacing,
+            frame_color=args.frame_bg,
+            inner_border_width=args.inner_border_width,
+            inner_border_color=args.inner_border_color,
+        )
 
     output_path = Path(args.output)
     img.save(output_path)
