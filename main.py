@@ -8,8 +8,9 @@ and color based on the type of layer.
 """
 
 import argparse
+import concurrent.futures
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import mlx.core as mx
@@ -30,6 +31,34 @@ class WeightBlock:
     height: int
     x: int = 0
     y: int = 0
+    row_lengths: list[int] | None = field(default=None)
+
+
+def _poly_fits_at(occupancy: list[int], x: int, y: int, row_lengths: list[int]) -> bool:
+    for i, row_len in enumerate(row_lengths):
+        if row_len <= 0:
+            continue
+        mask = ((1 << row_len) - 1) << x
+        row_idx = y + i
+        if row_idx < len(occupancy) and (occupancy[row_idx] & mask):
+            return False
+    return True
+
+
+def _poly_find_in_range(
+    occupancy: list[int],
+    row_lengths: list[int],
+    canvas_width: int,
+    shape_w: int,
+    y_start: int,
+    y_end: int,
+) -> tuple[int, int] | None:
+    x_limit = canvas_width - shape_w + 1
+    for y in range(y_start, y_end):
+        for x in range(0, x_limit):
+            if _poly_fits_at(occupancy, x, y, row_lengths):
+                return (y, x)
+    return None
 
 
 # Palette definitions (RGB), sourced from Matplotlib's categorical palettes.
@@ -277,14 +306,25 @@ def print_histogram(samples: np.ndarray, title: str, bins: int = 40, width: int 
     print(f"{bin_edges[-1]:8.3f} |")
 
 
-def normalize_array(arr: np.ndarray, global_min: float, global_max: float) -> np.ndarray:
-    """Normalize a numpy array to [0, 1] using linear scaling."""
+def normalize_array(
+    arr: np.ndarray,
+    global_min: float,
+    global_max: float,
+    clip_percent: float = 0.0,
+) -> np.ndarray:
+    """Normalize a numpy array to [0, 1] using linear scaling with optional percentile clipping."""
+    if clip_percent > 0:
+        pct = min(49.0, max(0.0, clip_percent))
+        low = np.percentile(arr, pct)
+        high = np.percentile(arr, 100.0 - pct)
+        global_min = max(global_min, float(low))
+        global_max = min(global_max, float(high))
+
     if global_max <= global_min:
         return np.full_like(arr, 0.5)
 
-    # Simple linear normalization
     normalized = (arr - global_min) / (global_max - global_min)
-
+    normalized = np.clip(normalized, 0.0, 1.0)
     return normalized
 
 
@@ -368,6 +408,7 @@ def create_weight_blocks(
     intensity_method: str = "sigmoid",
     intensity_gamma: float = 0.75,
     intensity_sigmoid_k: float = 6.0,
+    intensity_clip_percent: float = 0.0,
     show_histogram: bool = False,
 ) -> list[WeightBlock]:
     """Create WeightBlock objects from weight tensors."""
@@ -399,7 +440,12 @@ def create_weight_blocks(
     for name, reduced in tqdm(reduced_weights, desc="Creating blocks"):
         # Normalize each block to its own range for maximum contrast
         block_min, block_max = float(reduced.min()), float(reduced.max())
-        normalized = normalize_array(reduced, block_min, block_max)
+        normalized = normalize_array(
+            reduced,
+            block_min,
+            block_max,
+            clip_percent=intensity_clip_percent,
+        )
         normalized = apply_intensity_curve(
             normalized,
             method=intensity_method,
@@ -766,11 +812,212 @@ def pack_blocks_shelf(blocks: list[WeightBlock], padding: int = 2) -> tuple[int,
     return total_width, total_height, positioned
 
 
+def build_row_lengths(num_weights: int, width: int) -> list[int]:
+    """Build row lengths for a left-justified polyomino of size num_weights."""
+    width = max(1, int(width))
+    height = (num_weights + width - 1) // width
+    if height <= 1:
+        return [num_weights]
+    last_row = num_weights - width * (height - 1)
+    return [width] * (height - 1) + [last_row]
+
+
+def rotate_row_lengths(row_lengths: list[int]) -> tuple[list[int], int, int]:
+    """Rotate a left-justified polyomino 90 degrees clockwise."""
+    height = len(row_lengths)
+    width = max(row_lengths) if row_lengths else 0
+    rotated = []
+    for y in range(width):
+        rotated.append(sum(1 for r in row_lengths if r > y))
+    return rotated, height, width
+
+
+def pack_blocks_polyomino(
+    blocks: list[WeightBlock],
+    padding: int = 0,
+    workers: int = 1,
+) -> tuple[int, int, list[WeightBlock]]:
+    """Pack blocks as left-justified polyominoes using a bottom-left heuristic."""
+    if not blocks:
+        return 0, 0, []
+
+    total_weights = sum(len(b.weights) for b in blocks)
+    sorted_blocks = sorted(blocks, key=lambda b: len(b.weights), reverse=True)
+
+    # Choose a reasonable canvas width to start with.
+    canvas_width = int(np.sqrt(total_weights) * 1.05)
+    if canvas_width <= 0:
+        canvas_width = 1
+
+    # Ensure the width can accommodate the widest candidate shape.
+    max_shape_width = 1
+    for b in sorted_blocks:
+        base_width = max(1, int(np.sqrt(len(b.weights))))
+        row_lengths = build_row_lengths(len(b.weights), base_width)
+        max_shape_width = max(max_shape_width, max(row_lengths))
+        rotated, _, _ = rotate_row_lengths(row_lengths)
+        max_shape_width = max(max_shape_width, max(rotated))
+    canvas_width = max(canvas_width, max_shape_width)
+
+    occupancy: list[int] = []
+    positioned: list[WeightBlock] = []
+
+    def ensure_height(h: int) -> None:
+        while len(occupancy) < h:
+            occupancy.append(0)
+
+    executor = None
+    if workers > 1:
+        executor = concurrent.futures.ProcessPoolExecutor(max_workers=workers)
+
+    try:
+        for block in tqdm(sorted_blocks, desc="Packing polyominoes"):
+            num_weights = len(block.weights)
+            base_width = max(1, int(np.sqrt(num_weights)))
+            row_lengths = build_row_lengths(num_weights, base_width)
+            rotated_rows, rotated_w, rotated_h = rotate_row_lengths(row_lengths)
+
+            candidates = [
+                (row_lengths, max(row_lengths), len(row_lengths)),
+                (rotated_rows, rotated_w, rotated_h),
+            ]
+
+            placed = False
+            best = None
+
+            for rows, shape_w, shape_h in candidates:
+                if shape_w > canvas_width:
+                    continue
+                current_height = len(occupancy)
+                if executor is not None and current_height > 0:
+                    y_end = current_height + 1
+                    chunk = max(1, (y_end + workers - 1) // workers)
+                    tasks = []
+                    for w in range(workers):
+                        y_start = w * chunk
+                        y_stop = min(y_end, (w + 1) * chunk)
+                        if y_start >= y_stop:
+                            continue
+                        tasks.append((y_start, y_stop))
+
+                    futures = [
+                        executor.submit(
+                            _poly_find_in_range,
+                            occupancy,
+                            rows,
+                            canvas_width,
+                            shape_w,
+                            y_start,
+                            y_stop,
+                        )
+                        for (y_start, y_stop) in tasks
+                    ]
+                    results = []
+                    for fut in concurrent.futures.as_completed(futures):
+                        res = fut.result()
+                        if res is not None:
+                            results.append(res)
+
+                    if results:
+                        y, x = min(results, key=lambda t: (t[0], t[1]))
+                        best = (x, y, rows, shape_w, shape_h)
+                        placed = True
+                else:
+                    for y in range(0, current_height + 1):
+                        for x in range(0, canvas_width - shape_w + 1):
+                            if _poly_fits_at(occupancy, x, y, rows):
+                                best = (x, y, rows, shape_w, shape_h)
+                                placed = True
+                                break
+                        if placed:
+                            break
+                if placed:
+                    break
+
+            if not placed:
+                # Place at bottom-left with height expansion.
+                rows, shape_w, shape_h = candidates[0]
+                if shape_w > canvas_width:
+                    canvas_width = shape_w
+                y = len(occupancy)
+                x = 0
+                ensure_height(y + shape_h)
+                best = (x, y, rows, shape_w, shape_h)
+
+            x, y, rows, shape_w, shape_h = best
+            ensure_height(y + shape_h)
+            for i, row_len in enumerate(rows):
+                if row_len <= 0:
+                    continue
+                mask = ((1 << row_len) - 1) << x
+                occupancy[y + i] |= mask
+
+            block.x = x
+            block.y = y
+            block.width = shape_w
+            block.height = shape_h
+            block.row_lengths = rows
+            positioned.append(block)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    while occupancy and occupancy[-1] == 0:
+        occupancy.pop()
+
+    total_width = max((row.bit_length() for row in occupancy), default=0)
+    total_width = max(total_width, 1) if total_weights > 0 else 0
+    total_height = len(occupancy)
+    return total_width, total_height, positioned
+
+
+def clone_blocks(blocks: list[WeightBlock]) -> list[WeightBlock]:
+    """Clone blocks without copying large weight arrays."""
+    return [
+        WeightBlock(
+            name=b.name,
+            weights=b.weights,
+            category=b.category,
+            width=b.width,
+            height=b.height,
+            x=b.x,
+            y=b.y,
+            row_lengths=b.row_lengths,
+        )
+        for b in blocks
+    ]
+
+
+def pack_blocks_best(blocks: list[WeightBlock], padding: int = 2) -> tuple[int, int, list[WeightBlock]]:
+    """Try multiple packers and return the one with the least wasted space."""
+    if not blocks:
+        return 0, 0, []
+
+    packers = {
+        "maxrects": pack_blocks_maxrects,
+        "guillotine": pack_blocks_guillotine,
+        "shelf": pack_blocks_shelf,
+    }
+    best = None
+    best_area = None
+
+    for name, packer in packers.items():
+        trial_blocks = clone_blocks(blocks)
+        width, height, positioned = packer(trial_blocks, padding=padding)
+        area = width * height
+        if best is None or area < best_area:
+            best = (width, height, positioned, name)
+            best_area = area
+
+    if best is None:
+        return 0, 0, []
+    return best[0], best[1], best[2]
 def render_image(
     blocks: list[WeightBlock],
     width: int,
     height: int,
     background: tuple[int, int, int] = (20, 20, 20),
+    color_method: str = "blackwhite",
 ) -> Image.Image:
     """Render the weight blocks to an image using vectorized numpy operations."""
     # Create RGB array
@@ -817,40 +1064,54 @@ def render_image(
             print(f"  block.height type: {type(block.height)}, block.width type: {type(block.width)}")
             raise
 
-        # Apply color: 0.5 = palette color, 0 = black, 1 = white
-        # Values below 0.5: blend from black to color
-        # Values above 0.5: blend from color to white
         t = block_2d[:, :, np.newaxis]  # Shape: (H, W, 1)
 
-        # Below 0.5: lerp from black (0,0,0) to color
-        # Above 0.5: lerp from color to white (255,255,255)
-        below_mask = t < 0.5
+        if color_method == "opacity":
+            # Opacity: 0 -> black, 1 -> full palette color.
+            block_rgb = (t * color).astype(np.uint8)
+        else:
+            # Blackwhite: 0.5 = palette color, 0 = black, 1 = white.
+            below_mask = t < 0.5
 
-        # For below 0.5: t=0 -> black, t=0.5 -> color
-        # Scale t from [0, 0.5] to [0, 1]
-        t_below = t * 2.0
-        color_below = t_below * color
+            # For below 0.5: t=0 -> black, t=0.5 -> color
+            t_below = t * 2.0
+            color_below = t_below * color
 
-        # For above 0.5: t=0.5 -> color, t=1 -> white
-        # Scale t from [0.5, 1] to [0, 1]
-        t_above = (t - 0.5) * 2.0
-        color_above = color + t_above * (255.0 - color)
+            # For above 0.5: t=0.5 -> color, t=1 -> white
+            t_above = (t - 0.5) * 2.0
+            color_above = color + t_above * (255.0 - color)
 
-        block_rgb = np.where(below_mask, color_below, color_above).astype(np.uint8)
+            block_rgb = np.where(below_mask, color_below, color_above).astype(np.uint8)
 
         # Place in canvas
-        y1, y2 = block.y, block.y + block.height
-        x1, x2 = block.x, block.x + block.width
+        if block.row_lengths is None:
+            y1, y2 = block.y, block.y + block.height
+            x1, x2 = block.x, block.x + block.width
 
-        # Clip to canvas bounds
-        cy1, cy2 = max(0, y1), min(height, y2)
-        cx1, cx2 = max(0, x1), min(width, x2)
+            # Clip to canvas bounds
+            cy1, cy2 = max(0, y1), min(height, y2)
+            cx1, cx2 = max(0, x1), min(width, x2)
 
-        # Corresponding block region
-        by1, by2 = cy1 - y1, block.height - (y2 - cy2)
-        bx1, bx2 = cx1 - x1, block.width - (x2 - cx2)
+            # Corresponding block region
+            by1, by2 = cy1 - y1, block.height - (y2 - cy2)
+            bx1, bx2 = cx1 - x1, block.width - (x2 - cx2)
 
-        canvas[cy1:cy2, cx1:cx2] = block_rgb[by1:by2, bx1:bx2]
+            canvas[cy1:cy2, cx1:cx2] = block_rgb[by1:by2, bx1:bx2]
+        else:
+            for row_idx, row_len in enumerate(block.row_lengths):
+                if row_len <= 0:
+                    continue
+                y = block.y + row_idx
+                if y < 0 or y >= height:
+                    continue
+                x1 = block.x
+                x2 = block.x + row_len
+                cx1, cx2 = max(0, x1), min(width, x2)
+                if cx1 >= cx2:
+                    continue
+                bx1 = cx1 - x1
+                bx2 = bx1 + (cx2 - cx1)
+                canvas[y, cx1:cx2] = block_rgb[row_idx, bx1:bx2]
 
     return Image.fromarray(canvas)
 
@@ -875,6 +1136,7 @@ def render_framed_image(
     background: tuple[int, int, int] = (20, 20, 20),
     frame_color: tuple[int, int, int] = (40, 40, 40),
     text_color: tuple[int, int, int] = (200, 200, 200),
+    color_method: str = "blackwhite",
 ) -> Image.Image:
     """Render the weight visualization with a frame, info text, and legend."""
 
@@ -992,7 +1254,7 @@ def render_framed_image(
         return [[p] for p in prepared], [col_w], col_w
 
     # Render the main visualization
-    main_image = render_image(blocks, width, height, background)
+    main_image = render_image(blocks, width, height, background, color_method=color_method)
 
     # Calculate dimensions for frame, text, and legend
     frame_padding = max(0, int(frame_padding))
@@ -1209,6 +1471,12 @@ def main():
         help="Steepness for sigmoid intensity curve (default: 6.0)",
     )
     parser.add_argument(
+        "--intensity-clip-percent",
+        type=float,
+        default=0.0,
+        help="Clip top/bottom N percentile before normalization (default: 0)",
+    )
+    parser.add_argument(
         "--palette",
         type=str,
         choices=sorted(PALETTES.keys()),
@@ -1216,11 +1484,24 @@ def main():
         help=f"Color palette for layer categories (default: {DEFAULT_PALETTE_NAME})",
     )
     parser.add_argument(
+        "--color-method",
+        type=str,
+        choices=["blackwhite", "opacity"],
+        default="blackwhite",
+        help="Color intensity mapping (default: blackwhite)",
+    )
+    parser.add_argument(
+        "--polyomino-workers",
+        type=int,
+        default=1,
+        help="Number of worker processes for polyomino packing (default: 1)",
+    )
+    parser.add_argument(
         "--packing",
         type=str,
-        choices=["maxrects", "guillotine", "shelf"],
-        default="maxrects",
-        help="Block packing algorithm (default: maxrects)",
+        choices=["best", "maxrects", "guillotine", "shelf", "polyomino"],
+        default="best",
+        help="Block packing algorithm (default: best)",
     )
     parser.add_argument(
         "--no-frame",
@@ -1300,13 +1581,20 @@ def main():
         intensity_method=args.intensity_method,
         intensity_gamma=args.intensity_gamma,
         intensity_sigmoid_k=args.intensity_sigmoid_k,
+        intensity_clip_percent=args.intensity_clip_percent,
         show_histogram=args.histogram,
     )
 
     packers = {
+        "best": pack_blocks_best,
         "maxrects": pack_blocks_maxrects,
         "guillotine": pack_blocks_guillotine,
         "shelf": pack_blocks_shelf,
+        "polyomino": lambda b, padding: pack_blocks_polyomino(
+            b,
+            padding=padding,
+            workers=max(1, args.polyomino_workers),
+        ),
     }
     width, height, positioned_blocks = packers[args.packing](blocks, padding=args.padding)
     print(f"Canvas size: {width} x {height} pixels")
@@ -1332,6 +1620,7 @@ def main():
             frame_color=args.frame_bg,
             inner_border_width=args.inner_border_width,
             inner_border_color=args.inner_border_color,
+            color_method=args.color_method,
         )
 
     output_path = Path(args.output)
