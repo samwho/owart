@@ -1,7 +1,7 @@
 [project]
-name = "openweights-art"
+name = "owart"
 version = "0.1.0"
-description = "Add your description here"
+description = "Poster-style visualizations of neural network weights."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -11,3 +11,10 @@ dependencies = [
     "numpy>=2.0.0",
     "tqdm>=4.67.1",
 ]
+
+[project.scripts]
+owart = "owart.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.21.1"]
+build-backend = "hatchling.build"
