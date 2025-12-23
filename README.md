@@ -2,6 +2,8 @@
 
 Generates posters based on neural network weights.
 
+![Llama 3.2 1B Instruct weight visualization](examples/mlx-community_Llama-3.2-1B-Instruct-4bit.png)
+
 Pick an MLX-compatible model and this script will iterate over those weights
 and do the following:
 
