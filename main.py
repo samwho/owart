@@ -85,34 +85,13 @@ def categorize_weight(name: str) -> str:
     return normalize_weight_name(name)
 
 
-def dequantize_weight(weight: mx.array, scales: mx.array, biases: mx.array, bits: int = 4) -> mx.array:
-    """Dequantize a packed weight tensor."""
-    values_per_int = 32 // bits
-    mask = (1 << bits) - 1
-
-    out_features = weight.shape[0]
-    packed_in = weight.shape[1]
-    in_features = packed_in * values_per_int
-
-    # Unpack all values at once using vectorized operations
-    shifts = mx.array([i * bits for i in range(values_per_int)])
-    # Broadcast: weight is (out, packed), shifts is (values_per_int,)
-    # Result: (out, packed, values_per_int)
-    unpacked = (weight[:, :, None] >> shifts) & mask
-
-    # Convert to signed
-    mid = 1 << (bits - 1)
-    unpacked = unpacked.astype(mx.float32) - mid
-
-    # Reshape to (out_features, in_features)
-    unpacked = unpacked.reshape(out_features, in_features)
-
-    # Apply scales and biases
-    group_size = in_features // scales.shape[1]
-    scales_expanded = mx.repeat(scales, group_size, axis=1)
-    biases_expanded = mx.repeat(biases, group_size, axis=1)
-
-    return unpacked * scales_expanded + biases_expanded
+def detect_quant_mode(scales: mx.array, biases) -> str:
+    """Detect the quantization mode based on scales and biases."""
+    # MXFP4/MXFP8 use uint8 scales and no biases
+    if biases is None and scales.dtype == mx.uint8:
+        return "mxfp4"
+    # Standard affine quantization has biases
+    return "affine"
 
 
 def extract_weights(model) -> list[tuple[str, mx.array]]:
@@ -128,15 +107,20 @@ def extract_weights(model) -> list[tuple[str, mx.array]]:
         if isinstance(value, mx.array):
             weights.append((name, value))
         elif isinstance(value, dict):
-            if "weight" in value and "scales" in value and "biases" in value:
+            if "weight" in value and "scales" in value:
                 try:
                     w = value["weight"]
                     s = value["scales"]
-                    b = value["biases"]
+                    b = value.get("biases")
                     bits = value.get("bits", 4)
+                    group_size = value.get("group_size", 64)
                     if isinstance(bits, mx.array):
                         bits = int(bits.item())
-                    dequantized = dequantize_weight(w, s, b, bits)
+                    if isinstance(group_size, mx.array):
+                        group_size = int(group_size.item())
+
+                    mode = value.get("mode") or detect_quant_mode(s, b)
+                    dequantized = mx.dequantize(w, s, b, group_size, bits, mode=mode)
                     weights.append((name, dequantized))
                 except Exception as e:
                     print(f"  Warning: Could not dequantize {name}: {e}")
@@ -147,21 +131,27 @@ def extract_weights(model) -> list[tuple[str, mx.array]]:
                     add_weight(f"{name}.{k}", v)
 
     def traverse(obj, prefix=""):
+        # First, check if this is a quantized layer (has weight and scales in parameters)
         if hasattr(obj, "parameters"):
             params = obj.parameters()
-            # Check if this is a quantized layer (has weight, scales, biases at top level)
-            if "weight" in params and "scales" in params and "biases" in params:
+            if "weight" in params and "scales" in params:
+                # This is a quantized layer - get metadata from the layer object
+                if hasattr(obj, "group_size"):
+                    params["group_size"] = obj.group_size
+                if hasattr(obj, "bits"):
+                    params["bits"] = obj.bits
+                if hasattr(obj, "mode"):
+                    params["mode"] = obj.mode
                 add_weight(prefix, params)
-            else:
-                for name, param in params.items():
-                    full_name = f"{prefix}.{name}" if prefix else name
-                    add_weight(full_name, param)
+                return  # Don't recurse into children for quantized layers
 
+        # Recurse into children
         if hasattr(obj, "children"):
             for name, child in obj.children().items():
                 full_name = f"{prefix}.{name}" if prefix else name
                 traverse(child, full_name)
 
+        # Handle lists/sequences of modules
         if hasattr(obj, "__iter__") and not isinstance(obj, (str, dict, mx.array)):
             try:
                 for i, item in enumerate(obj):
@@ -169,6 +159,16 @@ def extract_weights(model) -> list[tuple[str, mx.array]]:
                         traverse(item, f"{prefix}.{i}" if prefix else str(i))
             except TypeError:
                 pass
+
+        # For non-quantized layers with parameters, add them directly
+        if hasattr(obj, "parameters"):
+            params = obj.parameters()
+            if "weight" not in params or "scales" not in params:
+                # Not a quantized layer - add individual parameters
+                for name, param in params.items():
+                    if isinstance(param, mx.array):
+                        full_name = f"{prefix}.{name}" if prefix else name
+                        add_weight(full_name, param)
 
     if hasattr(model, "model"):
         traverse(model.model, "model")
@@ -188,35 +188,50 @@ def calculate_block_dimensions(size: int) -> tuple[int, int]:
 
 def tensor_to_float32(tensor: mx.array) -> np.ndarray:
     """Convert a tensor to a flattened float32 numpy array."""
-    arr = np.array(tensor).flatten().astype(np.float32)
+    # Convert to float32 in MLX first to handle bfloat16 and other types
+    # that numpy doesn't support directly
+    tensor_f32 = tensor.astype(mx.float32)
+    arr = np.array(tensor_f32).flatten()
     return arr
 
 
-def compute_global_min_max(weights: list[tuple[str, mx.array]]) -> tuple[float, float]:
-    """Compute the global min and max across all weight tensors."""
-    global_min = float('inf')
-    global_max = float('-inf')
+def print_histogram(samples: np.ndarray, title: str, bins: int = 40, width: int = 50):
+    """Print an ASCII histogram to the terminal."""
+    hist, bin_edges = np.histogram(samples, bins=bins)
+    max_count = hist.max()
 
-    for name, tensor in tqdm(weights, desc="Computing global range"):
-        arr = tensor_to_float32(tensor)
-        tensor_min, tensor_max = float(arr.min()), float(arr.max())
-        global_min = min(global_min, tensor_min)
-        global_max = max(global_max, tensor_max)
+    print(f"\n{title}")
+    print(f"Range: [{samples.min():.4f}, {samples.max():.4f}]")
+    print()
 
-    return global_min, global_max
-
-
-def normalize_tensor(tensor: mx.array, global_min: float, global_max: float) -> np.ndarray:
-    """Normalize a tensor to [0, 1] range using global min/max."""
-    arr = tensor_to_float32(tensor)
-
-    if global_max > global_min:
-        return (arr - global_min) / (global_max - global_min)
-    return np.zeros_like(arr)
+    for i, count in enumerate(hist):
+        bar_len = int((count / max_count) * width) if max_count > 0 else 0
+        bar = "█" * bar_len
+        left = bin_edges[i]
+        print(f"{left:8.3f} |{bar}")
+    print(f"{bin_edges[-1]:8.3f} |")
 
 
-def reduce_weights(weights: np.ndarray, scale: int) -> np.ndarray:
-    """Reduce weights by averaging scale x scale blocks into single pixels."""
+def normalize_array(arr: np.ndarray, global_min: float, global_max: float) -> np.ndarray:
+    """Normalize a numpy array to [0, 1] using linear scaling."""
+    if global_max <= global_min:
+        return np.full_like(arr, 0.5)
+
+    # Simple linear normalization
+    normalized = (arr - global_min) / (global_max - global_min)
+
+    return normalized
+
+
+def reduce_weights(weights: np.ndarray, scale: int, method: str = "mean") -> np.ndarray:
+    """Reduce weights by combining scale x scale blocks into single pixels.
+
+    Methods:
+        mean: Average values (smooth, but loses contrast)
+        median: Median value (balances smoothness and detail)
+        max: Maximum absolute value (preserves extremes, can be noisy)
+        sample: Take first value in each block (fast, preserves original values)
+    """
     if scale <= 1:
         return weights
 
@@ -234,25 +249,62 @@ def reduce_weights(weights: np.ndarray, scale: int) -> np.ndarray:
     # Reshape to 2D
     grid = padded.reshape(new_height, new_width)
 
-    # Reshape to group scale x scale blocks and take mean
+    # Reshape to group scale x scale blocks
     reduced_height = new_height // scale
     reduced_width = new_width // scale
-    reduced = grid.reshape(reduced_height, scale, reduced_width, scale).mean(axis=(1, 3))
+    blocks = grid.reshape(reduced_height, scale, reduced_width, scale)
+
+    if method == "mean":
+        reduced = blocks.mean(axis=(1, 3))
+    elif method == "median":
+        # Median preserves more detail than mean while being smoother than max
+        blocks_flat = blocks.reshape(reduced_height, reduced_width, scale * scale)
+        reduced = np.median(blocks_flat, axis=2)
+    elif method == "max":
+        # Take the value with maximum absolute value (preserves sign)
+        blocks_flat = blocks.reshape(reduced_height, reduced_width, scale * scale)
+        max_idx = np.abs(blocks_flat).argmax(axis=2)
+        reduced = np.take_along_axis(blocks_flat, max_idx[:, :, np.newaxis], axis=2).squeeze(axis=2)
+    elif method == "sample":
+        # Just take the first value in each block
+        reduced = blocks[:, 0, :, 0]
+    else:
+        raise ValueError(f"Unknown reduction method: {method}")
 
     return reduced.flatten()
 
 
-def create_weight_blocks(weights: list[tuple[str, mx.array]], scale: int = 1) -> list[WeightBlock]:
+def create_weight_blocks(weights: list[tuple[str, mx.array]], scale: int = 1, scale_method: str = "mean", show_histogram: bool = False) -> list[WeightBlock]:
     """Create WeightBlock objects from weight tensors."""
-    # Compute global min/max for normalization
-    global_min, global_max = compute_global_min_max(weights)
-    print(f"Global weight range: [{global_min:.6f}, {global_max:.6f}]")
+    # First pass: reduce all weights
+    reduced_weights = []
 
+    for name, tensor in tqdm(weights, desc="Reducing weights"):
+        raw = tensor_to_float32(tensor)
+        reduced = reduce_weights(raw, scale, method=scale_method)
+        reduced_weights.append((name, reduced))
+
+    # Show histogram if requested
+    if show_histogram:
+        all_samples = []
+        max_samples = 10000
+        for name, reduced in reduced_weights:
+            if len(reduced) > max_samples:
+                indices = np.random.choice(len(reduced), max_samples, replace=False)
+                all_samples.append(reduced[indices])
+            else:
+                all_samples.append(reduced)
+        samples = np.concatenate(all_samples)
+
+        print_histogram(samples, "Raw Weight Distribution (after reduction)")
+
+    # Second pass: normalize each block individually and create blocks
     blocks = []
 
-    for name, tensor in tqdm(weights, desc="Creating blocks"):
-        normalized = normalize_tensor(tensor, global_min, global_max)
-        reduced = reduce_weights(normalized, scale)
+    for name, reduced in tqdm(reduced_weights, desc="Creating blocks"):
+        # Normalize each block to its own range for maximum contrast
+        block_min, block_max = float(reduced.min()), float(reduced.max())
+        normalized = normalize_array(reduced, block_min, block_max)
 
         category = categorize_weight(name)
         # Dimensions will be set during packing, so use placeholder values
@@ -261,7 +313,7 @@ def create_weight_blocks(weights: list[tuple[str, mx.array]], scale: int = 1) ->
         blocks.append(
             WeightBlock(
                 name=name,
-                weights=reduced,
+                weights=normalized,
                 category=category,
                 width=width,
                 height=height,
@@ -664,8 +716,26 @@ def render_image(
             print(f"  block.height type: {type(block.height)}, block.width type: {type(block.width)}")
             raise
 
-        # Apply color: multiply intensity by color
-        block_rgb = (block_2d[:, :, np.newaxis] * color).astype(np.uint8)
+        # Apply color: 0.5 = palette color, 0 = black, 1 = white
+        # Values below 0.5: blend from black to color
+        # Values above 0.5: blend from color to white
+        t = block_2d[:, :, np.newaxis]  # Shape: (H, W, 1)
+
+        # Below 0.5: lerp from black (0,0,0) to color
+        # Above 0.5: lerp from color to white (255,255,255)
+        below_mask = t < 0.5
+
+        # For below 0.5: t=0 -> black, t=0.5 -> color
+        # Scale t from [0, 0.5] to [0, 1]
+        t_below = t * 2.0
+        color_below = t_below * color
+
+        # For above 0.5: t=0.5 -> color, t=1 -> white
+        # Scale t from [0.5, 1] to [0, 1]
+        t_above = (t - 0.5) * 2.0
+        color_above = color + t_above * (255.0 - color)
+
+        block_rgb = np.where(below_mask, color_below, color_above).astype(np.uint8)
 
         # Place in canvas
         y1, y2 = block.y, block.y + block.height
@@ -712,6 +782,18 @@ def main():
         default=1,
         help="Reduce image size by averaging NxN weight blocks into single pixels (default: 1, no reduction)",
     )
+    parser.add_argument(
+        "--histogram",
+        action="store_true",
+        help="Show ASCII histogram of weight distribution",
+    )
+    parser.add_argument(
+        "--scale-method",
+        type=str,
+        choices=["mean", "median", "max", "sample"],
+        default="mean",
+        help="Method for reducing pixels: mean (average), median (balanced), max (extremes), sample (first value)",
+    )
 
     args = parser.parse_args()
 
@@ -722,10 +804,10 @@ def main():
     weights = extract_weights(model)
     print(f"Found {len(weights)} weight tensors")
 
-    total_params = sum(np.prod(np.array(w).shape) for _, w in weights)
+    total_params = sum(np.prod(w.shape) for _, w in weights)
     print(f"Total parameters: {total_params:,}")
 
-    blocks = create_weight_blocks(weights, scale=args.scale)
+    blocks = create_weight_blocks(weights, scale=args.scale, scale_method=args.scale_method, show_histogram=args.histogram)
 
     width, height, positioned_blocks = pack_blocks_maxrects(blocks, padding=args.padding)
     print(f"Canvas size: {width} x {height} pixels")
