@@ -1,0 +1,13 @@
+[project]
+name = "openweights-art"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "mlx>=0.30.1",
+    "mlx-lm>=0.21.0",
+    "pillow>=11.0.0",
+    "numpy>=2.0.0",
+    "tqdm>=4.67.1",
+]
